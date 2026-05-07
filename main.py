@@ -7,7 +7,7 @@ app = FastAPI()
 class ScrapeRequest(BaseModel):
     url: str
     wait_for: str = ""
-    timeout: int = 30000
+    timeout: int = 45000
     screenshot: bool = False
     extract_images: bool = True
 
@@ -19,17 +19,42 @@ def health():
 async def scrape(req: ScrapeRequest):
     try:
         from playwright.async_api import async_playwright
+        from playwright_stealth import stealth_async
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process"
+                ]
             )
             context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-                viewport={"width": 1280, "height": 900}
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+                timezone_id="America/New_York",
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+                    "Sec-Ch-Ua-Mobile": "?0",
+                    "Sec-Ch-Ua-Platform": '"macOS"'
+                }
             )
             page = await context.new_page()
-            await page.goto(req.url, wait_until="networkidle", timeout=req.timeout)
+            await stealth_async(page)
+
+            await page.goto(req.url, wait_until="domcontentloaded", timeout=req.timeout)
+            # Wait for Cloudflare check to clear
+            await page.wait_for_timeout(5000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except:
+                pass
 
             if req.wait_for:
                 try:
@@ -37,6 +62,7 @@ async def scrape(req: ScrapeRequest):
                 except:
                     pass
 
+            # Scroll to load lazy content
             await page.evaluate("""async () => {
                 await new Promise(resolve => {
                     let pos = 0;
@@ -48,7 +74,7 @@ async def scrape(req: ScrapeRequest):
                             clearInterval(timer);
                             resolve();
                         }
-                    }, 150);
+                    }, 200);
                 });
             }""")
             await page.wait_for_timeout(2000)
@@ -60,7 +86,7 @@ async def scrape(req: ScrapeRequest):
                     '[class*="lot-row"]', '[class*="LotCard"]',
                     '[class*="auction-item"]', '[class*="item-card"]',
                     '.hibid-lot', '.lot-listing', '[class*="LotItem"]',
-                    '[class*="lot_item"]', 'article'
+                    '[class*="lot_item"]', 'article', '[data-lot-id]'
                 ];
                 for (const sel of selectors) {
                     const cards = document.querySelectorAll(sel);
@@ -71,12 +97,9 @@ async def scrape(req: ScrapeRequest):
                             const price = card.querySelector('[class*="price"],[class*="estimate"],[class*="bid"],[class*="amount"]')?.innerText?.trim() || '';
                             const imgEl = card.querySelector('img');
                             const img = imgEl?.dataset?.src || imgEl?.dataset?.lazySrc || imgEl?.src || '';
-                            const imgSrcset = imgEl?.srcset?.split(',').pop()?.trim()?.split(' ')[0] || '';
                             if (title) items.push({
                                 lot: lotNum.replace(/[^0-9]/g, '') || String(i+1),
-                                title,
-                                image_url: imgSrcset || img,
-                                estimate: price
+                                title, image_url: img, estimate: price
                             });
                         });
                         break;
@@ -86,33 +109,12 @@ async def scrape(req: ScrapeRequest):
             }""")
 
             text = await page.inner_text("body")
-
-            screenshot_b64 = ""
-            if req.screenshot:
-                shot = await page.screenshot(full_page=True, type="jpeg", quality=60)
-                screenshot_b64 = base64.b64encode(shot).decode()
-
-            lot_screenshots = []
-            if lots and req.screenshot:
-                for sel in ['.lot-card','.catalogue-item','.lot-item','[class*="LotCard"]','[class*="auction-item"]']:
-                    cards = await page.query_selector_all(sel)
-                    if len(cards) > 2:
-                        for card in cards[:50]:
-                            try:
-                                shot = await card.screenshot(type="jpeg", quality=70)
-                                lot_screenshots.append(base64.b64encode(shot).decode())
-                            except:
-                                lot_screenshots.append("")
-                        break
-
             await browser.close()
             return {
                 "url": req.url,
                 "lots": lots,
                 "raw_text": text[:20000],
-                "lot_count": len(lots),
-                "screenshot_b64": screenshot_b64,
-                "lot_screenshots": lot_screenshots
+                "lot_count": len(lots)
             }
     except Exception as e:
         raise HTTPException(500, f"Scrape error: {str(e)}")
